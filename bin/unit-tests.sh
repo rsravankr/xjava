@@ -1,15 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
-gradle --version
+./gradlew --version
 
 echo ""
 echo ">>> Running configlet..."
 bin/fetch-configlet
-bin/configlet .
+bin/configlet lint .
 
 pushd exercises
 echo ""
 echo ">>> Running tests..."
-TERM=dumb gradle check compileStarterSourceJava --continue
+TERM=dumb ../gradlew check compileStarterSourceJava --parallel --continue
 popd
-

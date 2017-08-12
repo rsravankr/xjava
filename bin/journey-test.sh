@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 
+TRACK=java
+TRACK_REPO="$TRACK"
+TRACK_SRC_EXT="java"
+CPU_CORES=`getconf NPROCESSORS_ONLN 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1`
+
 on_exit() {
   echo ">>> on_exit()"
   if [[ "$xapi_pid" != "" ]] ; then
@@ -16,7 +21,7 @@ assert_installed() {
 
   if [[ "`which $binary`" == "" ]]; then
     echo "${binary} not found; it is required to perform this test."
-    echo -e "Have you completed the setup instructions at https://github.com/exercism/xjava ?\n"
+    echo -e "Have you completed the setup instructions at https://github.com/exercism/${TRACK_REPO} ?\n"
     echo "PATH=${PATH}"
     echo "aborting."
     exit 1
@@ -35,7 +40,7 @@ assert_ruby_installed() {
   if [[ "${expected_ruby_ver}" != "" && "${current_ruby_ver}" != "${expected_ruby_ver}" ]]; then
     echo "${ruby_app_home} requires Ruby ${expected_ruby_ver}; current Ruby version is ${current_ruby_ver}."
     echo -e "Ruby used: `which ruby`.\n"
-    echo -e "Have you completed the setup instructions at https://github.com/exercism/xjava ?\n"
+    echo -e "Have you completed the setup instructions at https://github.com/exercism/${TRACK_REPO} ?\n"
     echo "PATH=${PATH}"
     echo "aborting."
     exit 1
@@ -59,7 +64,7 @@ clean() {
     rm -rf "${build_path}"
   fi
   cd exercises
-  gradle clean
+  "$EXECPATH"/gradlew clean
   cd ..
   echo "<<< clean()"
 }
@@ -71,6 +76,8 @@ get_operating_system() {
       (Linux*)
           echo "linux";;
       (Windows*)
+          echo "windows";;
+      (MINGW*)
           echo "windows";;
       (*)
           echo "linux";;
@@ -90,6 +97,14 @@ get_cpu_architecture() {
   esac
 }
 
+get_optimal_amount_of_jobs() {
+  if [ "$CPU_CORES" -gt "1" ]; then 
+    echo $((CPU_CORES-1))
+  else 
+    echo 1 
+  fi
+}
+
 download_exercism_cli() {
   local os="$1"
   local arch="$2"
@@ -102,10 +117,25 @@ download_exercism_cli() {
   # "curl..." :: HTTP 302 headers, including "Location" -- URL to redirect to.
   # "awk..." :: pluck last path segment from "Location" (i.e. the version number)
   local version="$(curl --head --silent ${latest} | awk -v FS=/ '/Location:/{print $NF}' | tr -d '\r')"
-  local download_url=${CLI_RELEASES}/download/${version}/exercism-${os}-${arch}.tgz
+
+  local download_url_suffix
+  local unzip_command
+  local unzip_from_file_option
+  if [[ ${os} == "windows" ]] ; then
+    download_url_suffix="zip"
+    unzip_command="unzip -d"
+    unzip_from_file_option=""
+  else
+    download_url_suffix="tgz"
+    unzip_command="tar xz -C"
+    unzip_from_file_option="-f"
+  fi
+  local download_url=${CLI_RELEASES}/download/${version}/exercism-${os}-${arch}.${download_url_suffix}
 
   mkdir -p ${exercism_home}
-  curl -s --location ${download_url} | tar xz -C ${exercism_home}
+  local temp=`mktemp`
+  curl -s --location ${download_url} > ${temp}
+  ${unzip_command} ${exercism_home} ${unzip_from_file_option} ${temp}
   echo "<<< download_exercism_cli()"
 }
 
@@ -121,21 +151,27 @@ git_clone() {
 
 make_local_trackler() {
   local trackler="$1"
-  echo ">>> make_local_trackler(trackler=\"${trackler}\")"
+  local xapi_home="$2"
+  echo ">>> make_local_trackler(trackler=\"${trackler}\", xapi_home=\"${xapi_home}\")"
 
-  local xjava=$( pwd )
+  local track_root=$( pwd )
   pushd ${trackler}
-  git submodule init -- common
+
+  # Get the version of Trackler x-api is currently using
+  local version=$( grep -m 1 'trackler' ${xapi_home}/Gemfile.lock | sed 's/.*(//' | sed 's/)//' )
+
+  git checkout v${version}
+  git submodule init -- problem-specifications
   git submodule update
 
-  # Bake in local copy of xjava; this is what we are testing.
-  rmdir tracks/java
-  mkdir -p tracks/java/exercises
-  cp ${xjava}/config.json tracks/java
-  cp -r ${xjava}/exercises tracks/java
+  # Bake in local copy of this track; this is what we are testing.
+  rmdir tracks/${TRACK}
+  mkdir -p tracks/${TRACK}/exercises
+  cp ${track_root}/config.json tracks/${TRACK}
+  cp -r ${track_root}/exercises tracks/${TRACK}
 
   gem install bundler
-  bundle install
+  bundle install --jobs $(get_optimal_amount_of_jobs)
   gem build trackler.gemspec
 
   # Make *this* the gem that x-api uses when we build x-api.
@@ -152,7 +188,7 @@ start_x_api() {
   pushd $xapi_home
 
   gem install bundler
-  bundle install
+  bundle install --jobs $(get_optimal_amount_of_jobs) 
   RACK_ENV=development rackup &
   xapi_pid=$!
   sleep 5
@@ -185,10 +221,10 @@ solve_all_exercises() {
   local exercism_configfile="$2"
   echo ">>> solve_all_exercises(exercism_exercises_dir=\"${exercism_exercises_dir}\", exercism_configfile=\"${exercism_configfile}\")"
 
-  local xjava=$( pwd )
+  local track_root=$( pwd )
   local exercism_cli="./exercism --config ${exercism_configfile}"
-  local exercises=`cat config.json | jq '.problems []' --raw-output`
-  local total_exercises=`cat config.json | jq '.problems | length'`
+  local exercises=`cat config.json | jq '.exercises[].slug + " "' --join-output`
+  local total_exercises=`cat config.json | jq '.exercises | length'`
   local current_exercise_number=1
   local tempfile="${TMPDIR:-/tmp}/journey-test.sh-unignore_all_tests.txt"
 
@@ -199,15 +235,20 @@ solve_all_exercises() {
     echo "${current_exercise_number} of ${total_exercises} -- ${exercise}"
     echo "=================================================="
 
-    ${exercism_cli} fetch java $exercise
-    cp -R -H ${xjava}/exercises/${exercise}/src/example/java/* ${exercism_exercises_dir}/java/${exercise}/src/main/java/
+    ${exercism_cli} fetch ${TRACK} $exercise
+    cp -R -H ${track_root}/exercises/${exercise}/src/example/${TRACK}/* ${exercism_exercises_dir}/${TRACK}/${exercise}/src/main/${TRACK}/
 
-    pushd ${exercism_exercises_dir}/java/${exercise}
+    pushd ${exercism_exercises_dir}/${TRACK}/${exercise}
+    # Check that tests compile before we strip @Ignore annotations
+    "$EXECPATH"/gradlew compileTestJava
     # Ensure we run all the tests (as delivered, all but the first is @Ignore'd)
-    for testfile in `find . -name "*Test.java"`; do
-      sed 's/@Ignore//' ${testfile} > "${tempfile}" && mv "${tempfile}" "${testfile}"
+    for testfile in `find . -name "*Test.${TRACK_SRC_EXT}"`; do
+      # Strip @Ignore annotations to ensure we run the tests (as delivered, all but the first is @Ignore'd).
+      # Note that unit-test.sh also strips @Ignore annotations via the Gradle task copyTestsFilteringIgnores.
+      # The stripping implementations here and in copyTestsFilteringIgnores should be kept consistent.
+      sed 's/@Ignore\(\(.*\)\)\{0,1\}//' ${testfile} > "${tempfile}" && mv "${tempfile}" "${testfile}"
     done
-    gradle test
+    "$EXECPATH"/gradlew test
     popd
 
     current_exercise_number=$((current_exercise_number + 1))
@@ -219,9 +260,9 @@ main() {
   # all functions assume current working directory is repository root.
   cd "${SCRIPTPATH}/.."
 
-  local xjava=$( pwd )
+  local track_root=$( pwd )
   local build_dir="build"
-  local build_path="${xjava}/${build_dir}"
+  local build_path="${track_root}/${build_dir}"
 
   local xapi_home="${build_path}/x-api"
   local trackler_home="${build_path}/trackler"
@@ -231,23 +272,28 @@ main() {
   local xapi_port=9292
 
   # fail fast if required binaries are not installed.
-  assert_installed "gradle"
   assert_installed "jq"
 
   clean "${build_dir}"
 
-  # Make a version of trackler that includes the source from this repo.
-  git_clone "trackler" "${trackler_home}"
-  assert_ruby_installed "${trackler_home}"
-  make_local_trackler "${trackler_home}"
+  # Download everything we need in parallel
+  git_clone "x-api" "${xapi_home}" &
+  git_clone "trackler" "${trackler_home}" &
+  download_exercism_cli $(get_operating_system) $(get_cpu_architecture) "${exercism_home}" &
+  wait
 
-  # Stand-up a local instance of x-api so we can fetch the exercises through it.
-  git_clone "x-api" "${xapi_home}"
-  assert_ruby_installed "${xapi_home}"
+  # Check and install the ruby stuff we need in parallel
+  assert_ruby_installed "${trackler_home}" &
+  assert_ruby_installed "${xapi_home}" &
+  wait
+
+  # Make a local version of trackler
+  make_local_trackler "${trackler_home}" "${xapi_home}"
+
+  # Start-up a local instance of x-api so we can fetch the exercises through it.
   start_x_api "${xapi_home}"
 
   # Create a CLI install and config just for this build; this script does not use your CLI install.
-  download_exercism_cli $(get_operating_system) $(get_cpu_architecture) "${exercism_home}"
   configure_exercism_cli "${exercism_home}" "${exercism_configfile}" "${xapi_port}"
 
   solve_all_exercises "${exercism_home}" "${exercism_configfile}"
@@ -257,7 +303,7 @@ main() {
 # Execution begins here...
 
 # If any command fails, fail the script.
-set -e
+set -ex
 SCRIPTPATH=$( pushd `dirname $0` > /dev/null && pwd && popd > /dev/null )
 EXECPATH=$( pwd )
 # Make output easier to read in CI
